@@ -1,0 +1,220 @@
+#version 430 core
+
+// ============================================================================
+// GPU CULL + COMPACTION for one grass capacity ring.
+//
+// One thread per candidate blade in the cells the CPU pre-cull listed: toroidal
+// wrap around the field centre, density allocation, frustum test (a cheap
+// conservative test at y = 0, then the tight test after the terrain snap). The
+// survivors are routed by distance into one of four buckets and drawn with
+// glDrawArraysIndirect:
+//
+//   bucket 0: high mesh + full physics   (near; inside the trample sim)
+//   bucket 1: medium mesh + trail physics (mid; inside the trail sim)
+//   bucket 2: medium mesh + per-vertex colour (far)
+//   bucket 3: rectangle + per-vertex colour   (distant)
+//
+// Bucket thresholds are dithered per blade so no radius switches all at once.
+//
+// DENSITY: one global density(d) curve, allocated across the rings by a ladder:
+// denser (smaller) rings supply first and fade out at their geometric edge, so
+// the rendered density equals density(d) with no seams between rings. Trampled
+// grass (from the trail sim) adds extra demand, which the inner ring's spare
+// capacity supplies.
+//
+// CPU mirrors of the curves: Grass/GrassLodSettings.cs.
+// ============================================================================
+
+layout(local_size_x = 256) in;
+
+#include "../common_uniforms.glsl"
+
+// Candidate blades, 3 floats each (12-byte stride): world X, world Z, blade
+// scale. Sorted into grid cells. CPU side: Grass/GrassField.cs.
+layout(std430, binding = 0) readonly buffer SrcInstances { float src[]; };
+
+// The cells of this ring worth running, nearest the camera first: the CPU
+// pre-cull (GrassCellCuller) leaves out every cell whose blades would all fail
+// the distance or frustum tests below. Two cells per uvec4, each (first
+// instance, instance count). Every listed cell gets GroupsPerCell work groups,
+// enough for the fullest cell. 512 = half of GrassCellCuller.CellCount.
+layout(std140, binding = 6) uniform CullCells { uvec4 cullCells[512]; };
+
+// Compacted per-bucket records:
+// x = wrapped world X, y = terrain height at the root, z = wrapped world Z,
+// w = packHalf2x16(widthScale, heightScale)
+layout(std430, binding = 1) writeonly buffer VisibleB0 { vec4 dst0[]; };
+layout(std430, binding = 2) writeonly buffer VisibleB1 { vec4 dst1[]; };
+layout(std430, binding = 3) writeonly buffer VisibleB2 { vec4 dst2[]; };
+layout(std430, binding = 4) writeonly buffer VisibleB3 { vec4 dst3[]; };
+
+// Four DrawArraysIndirect commands back to back, one per bucket:
+// {vertexCount, instanceCount, firstVertex, baseInstance}. The CPU fills in the
+// vertex counts each frame; instanceCount is bumped here. The baseInstance slot
+// doubles as an overflow counter (gl_InstanceID does not include baseInstance,
+// and the vertex shader indexes its buffer by gl_InstanceID).
+layout(std430, binding = 5) buffer DrawCommands { uint cmds[]; };
+
+// --- Per ring ---
+uniform int GroupsPerCell;
+uniform float FieldSize;          // this ring's wrap period
+uniform int RingIndex;            // 0 = densest, innermost ring
+
+// --- Shared by all dispatches ---
+uniform float FrustumMargin;
+uniform float TerrainHeightBound; // no terrain above or below this
+uniform vec4 FrustumPlanes[6];
+uniform int UseFrustumCulling;
+
+uniform vec4 RingCapacities;      // blades per square metre, rings 0..3
+uniform vec4 RingFadeStart;       // where each ring's capacity starts fading out
+uniform float RingFadeWidth;
+
+uniform float CurveNearDensity;
+uniform float CurvePlateau;
+uniform float CurveExponent;
+uniform float CurveFarFloor;
+uniform float CurveMaxDistance;
+const float CURVE_FADE_OUT = 80.0;
+
+// Width follows a coverage target (the eye judges coverage = density * width).
+uniform float WidthNear;
+uniform float CoverageFar;
+uniform float CoverageFalloffStart;
+uniform float WidthMax;
+
+uniform vec3 BucketDistances;     // near|mid, mid|far, far|distant
+uniform float BucketDither;
+uniform ivec4 BucketCapacities;
+
+uniform sampler2D TrailTexture;   // .g = trample
+uniform float TrailSimSize;
+uniform float TrailBoostDensity;  // extra blades per square metre at full trample
+
+#include "../common_terrain.glsl"
+
+float DensityCurve(float d) {
+    float rho = CurveNearDensity * pow(max(d, CurvePlateau) / CurvePlateau, -CurveExponent);
+    rho = max(rho, CurveFarFloor);
+    rho *= 1.0 - smoothstep(CurveMaxDistance - CURVE_FADE_OUT, CurveMaxDistance, d);
+    return rho;
+}
+
+// The width that keeps density * width on the coverage target at distance d.
+float WidthCurveAt(float d, float rho) {
+    float keep = mix(1.0, CoverageFar, smoothstep(CoverageFalloffStart, CurveMaxDistance, d));
+    float w = WidthNear * (CurveNearDensity / max(rho, 1e-3)) * keep;
+    return clamp(w, WidthNear, WidthMax);
+}
+
+float RingFade(int ring, float d) {
+    return 1.0 - smoothstep(RingFadeStart[ring], RingFadeStart[ring] + RingFadeWidth, d);
+}
+
+// Wraps a ring position to the copy nearest the field centre.
+vec3 GetInfinitePos(vec3 localPos) {
+    vec3 shift = floor((CenterPosition - localPos) / FieldSize + 0.5) * FieldSize;
+    shift.y = 0.0;
+    return localPos + shift;
+}
+
+bool IsInFrustum(vec3 pos, float margin) {
+    if (UseFrustumCulling == 0) return true;
+    for (int i = 0; i < 6; i++)
+        if (dot(FrustumPlanes[i].xyz, pos) + FrustumPlanes[i].w < -margin) return false;
+    return true;
+}
+
+void main()
+{
+    // 0. Which blade: this work group's listed cell, then the thread's place in it.
+    uint cellSlot = gl_WorkGroupID.x / uint(GroupsPerCell);
+    uint inCell = (gl_WorkGroupID.x - cellSlot * uint(GroupsPerCell)) * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uvec4 cellPair = cullCells[cellSlot >> 1u];
+    uvec2 cell = (cellSlot & 1u) == 0u ? cellPair.xy : cellPair.zw;
+    if (inCell >= cell.y) return;
+
+    uint srcBase = (cell.x + inCell) * 3u;
+    vec3 basePos = vec3(src[srcBase], 0.0, src[srcBase + 1u]);
+    float bladeScale = src[srcBase + 2u];
+
+    // 1. Endless field
+    vec3 instancePos = GetInfinitePos(basePos);
+    float randomVal = hash(basePos.xz);
+
+    // 2. Demand at this distance: the curve, plus extra blades where the grass
+    // lies trampled so a trail reads as a dense flattened carpet. Width comes
+    // from the un-boosted, supply-clamped density (below), so the boost adds
+    // coverage instead of shrinking blades.
+    float dist = distance(instancePos.xz, CenterPosition.xz);
+    float rhoCurve = DensityCurve(dist);
+    float rho = rhoCurve;
+
+    if (TrailBoostDensity > 0.0 && dist < TrailSimSize * 0.5) {
+        vec2 trailUV = (instancePos.xz / TrailSimSize) + 0.5;
+        rho += textureLod(TrailTexture, trailUV, 0.0).g * TrailBoostDensity;
+    }
+
+    // 3. Ladder allocation: denser rings supply first; this ring covers what
+    // they leave, up to its own (edge-faded) capacity.
+    float ladder = 0.0;
+    for (int j = 0; j < RingIndex; j++)
+        ladder += RingCapacities[j] * RingFade(j, dist);
+    float capacity = RingCapacities[RingIndex];
+    float available = capacity * RingFade(RingIndex, dist);
+    float keepProb = clamp(rho - ladder, 0.0, available) / capacity;
+
+    if (randomVal > keepProb) return;
+
+    // Supplied density: the curve clamped to the whole ring envelope. Where the
+    // rings cannot meet the target, blades widen to hold the coverage.
+    float envelope = 0.0;
+    for (int j = 0; j < 4; j++)
+        envelope += RingCapacities[j] * RingFade(j, dist);
+    float rhoSupplied = min(rhoCurve, envelope);
+
+    // 4. Conservative frustum test at y = 0 before the terrain noise; widening the
+    // margin by the height bound means it never rejects a blade the tight test keeps.
+    if (!IsInFrustum(instancePos, FrustumMargin + TerrainHeightBound)) return;
+
+    float terrainH = GetTerrainHeight(instancePos.xz);
+    instancePos.y = terrainH;
+    if (!IsInFrustum(instancePos, FrustumMargin)) return;
+
+    // 5. Bucket by dithered distance. A second hash decorrelates the dither
+    // from the keep decision above.
+    float dither = (hash(basePos.xz + vec2(37.0, 17.0)) - 0.5) * BucketDither;
+    float bucketDist = dist + dither;
+    int bucket = bucketDist < BucketDistances.x ? 0
+               : bucketDist < BucketDistances.y ? 1
+               : bucketDist < BucketDistances.z ? 2 : 3;
+
+    // 6. A ring that only just starts supplying at this distance grows its
+    // blades in small rather than popping them in.
+    float edgeScale = keepProb < 0.2 ? keepProb * 5.0 : 1.0;
+
+    // Mesh-area compensation: each bucket's mesh fills a different fraction of
+    // its width x height quad (high 0.80, medium 0.70, rectangle 0.95), so width
+    // is scaled by area0 / area to keep the canopy continuous across the mesh
+    // switches. CPU mirror: GrassLodSettings.MeshArea.
+    const vec4 MESH_AREA_COMP = vec4(1.0, 0.8 / 0.7, 0.8 / 0.7, 0.8 / 0.95);
+
+    float widthScale = bladeScale * edgeScale * WidthCurveAt(dist, rhoSupplied) * MESH_AREA_COMP[bucket];
+    float heightScale = bladeScale * edgeScale;
+    vec4 record = vec4(instancePos.x, terrainH, instancePos.z,
+                       uintBitsToFloat(packHalf2x16(vec2(widthScale, heightScale))));
+
+    // 7. Append. When the bucket is full, undo the bump and count the drop in
+    // the baseInstance slot instead.
+    uint slot = atomicAdd(cmds[bucket * 4 + 1], 1u);
+    if (slot >= uint(BucketCapacities[bucket])) {
+        atomicAdd(cmds[bucket * 4 + 1], uint(-1));
+        atomicAdd(cmds[bucket * 4 + 3], 1u);
+        return;
+    }
+
+    if (bucket == 0) dst0[slot] = record;
+    else if (bucket == 1) dst1[slot] = record;
+    else if (bucket == 2) dst2[slot] = record;
+    else dst3[slot] = record;
+}

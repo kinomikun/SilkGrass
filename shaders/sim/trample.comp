@@ -1,0 +1,83 @@
+#version 430 core
+
+// Trample simulation step for one toroidal field (Grass/GrassFluidSim.cs).
+//   r = wave depression (near field only), g = trample amount 0..1
+//
+// SimMode 0 (near field): trample recovers over RecoveryTime and diffuses to its
+//   neighbours, waves relax quickly.
+// SimMode 1 (trail field): trample recovers, no diffusion, no waves.
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+// rgba16f must match the format FluidField allocates and binds.
+layout (rgba16f, binding = 0) writeonly uniform image2D OutputFluid;
+layout (rgba16f, binding = 1) readonly uniform image2D InputFluid;
+
+uniform float DeltaTime;
+uniform float FieldSize;
+uniform int SimMode;
+uniform float RecoveryTime;
+// Neighbour-blur rate, pre-scaled on the CPU by (resolution / 1024)^2 so the
+// world-space spread is the same at every resolution.
+uniform float TrampleDiffusion;
+uniform vec2 SimCenter;       // world XZ the sim follows
+uniform vec2 TramplerPos;
+uniform float TramplerRadius;
+uniform float TramplerStrength; // 0 = nothing tramples
+
+vec4 wrappedLoad(ivec2 p) {
+    ivec2 size = imageSize(InputFluid);
+    return imageLoad(InputFluid, (p % size + size) % size);
+}
+
+// Shortest offset between two points on the torus
+vec2 wrappedDiff(vec2 a, vec2 b) {
+    vec2 d = a - b;
+    return d - round(d / FieldSize) * FieldSize;
+}
+
+void main() {
+    ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(OutputFluid);
+    if (id.x >= size.x || id.y >= size.y) return;
+
+    vec4 data = wrappedLoad(id);
+    float waveHeight = data.r;
+    float trample = isnan(data.g) ? 0.0 : data.g;
+
+    vec2 worldPos = (vec2(id) / vec2(size) - 0.5) * FieldSize;
+
+    // Wipe everything at the far edge of the torus. The clean edge moves with
+    // the sim centre and erases old trails before they can wrap around and
+    // reappear in front of the camera.
+    if (length(wrappedDiff(worldPos, SimCenter)) > FieldSize * 0.48) {
+        trample = 0.0;
+        waveHeight = 0.0;
+    }
+
+    trample = max(0.0, trample - DeltaTime / RecoveryTime);
+    if (SimMode == 0) {
+        float n = wrappedLoad(id + ivec2(0, 1)).g;
+        float s = wrappedLoad(id + ivec2(0, -1)).g;
+        float e = wrappedLoad(id + ivec2(1, 0)).g;
+        float w = wrappedLoad(id + ivec2(-1, 0)).g;
+        trample = mix(trample, (n + s + e + w) * 0.25, TrampleDiffusion * DeltaTime);
+        waveHeight -= waveHeight * 5.0 * DeltaTime;
+    } else {
+        waveHeight = 0.0;
+    }
+
+    // Only a trampler inside the live radius stamps this field: farther out its
+    // stamp would land on a texel that also maps to grass on the near side of
+    // the torus.
+    if (TramplerStrength > 0.001 && length(TramplerPos - SimCenter) < FieldSize * 0.48) {
+        float dist = length(wrappedDiff(worldPos, TramplerPos));
+        float inside = 1.0 - smoothstep(TramplerRadius * 0.7, TramplerRadius, dist);
+        if (inside > 0.0) {
+            trample = max(trample, inside * TramplerStrength);
+            if (SimMode == 0) waveHeight = min(waveHeight, -0.5 * inside * TramplerStrength);
+        }
+    }
+
+    imageStore(OutputFluid, id, vec4(waveHeight, trample, 0.0, 0.0));
+}
